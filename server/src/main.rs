@@ -9,7 +9,7 @@ use config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::init();
+    tracing_subscriber::fmt::init();
 
     let config = Config::parse();
     tracing::info!("WiFi Display Server starting");

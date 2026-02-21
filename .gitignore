@@ -1,0 +1,29 @@
+# Rust
+server/target/
+**/*.rs.bk
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/*.iml
+
+# Driver
+driver/**/*.obj
+driver/**/*.pdb
+driver/**/*.sys
+driver/**/*.cer
+driver/**/x64/
+driver/**/ARM64/
+driver/**/.vs/
+
+# IDE
+.idea/
+.vscode/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store

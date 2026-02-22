@@ -62,6 +62,19 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to create UDP transport")?,
     );
 
+    // Start touch input listener
+    let touch_port = config.touch_port;
+    let injector = Arc::new(
+        input::InputInjector::new(config.monitor_index)
+            .context("Failed to create input injector")?,
+    );
+    let touch_injector = injector.clone();
+    tokio::spawn(async move {
+        if let Err(e) = input::touch_listener(touch_port, touch_injector).await {
+            tracing::error!("Touch listener failed: {e:#}");
+        }
+    });
+
     tracing::info!("Streaming started. Press Ctrl+C to stop.");
 
     // Stats tracking

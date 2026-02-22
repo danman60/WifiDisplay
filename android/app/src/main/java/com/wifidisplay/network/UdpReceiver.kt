@@ -57,7 +57,7 @@ class UdpReceiver(private val port: Int) {
                 val seq = header.int           // [0..4] seq
                 val flags = data[4].toInt()     // [4] flags
                 val fragmentIndex = data[5].toInt() and 0xFF  // [5] fragment_index
-                val nalSize = (header.position(6).short.toInt() and 0xFFFF)  // [6..8] nal_size
+                val nalSize = (ByteBuffer.wrap(data, 6, 2).order(ByteOrder.LITTLE_ENDIAN).getShort().toInt() and 0xFFFF)  // [6..8] nal_size
 
                 val isKeyframe = (flags and 0x01) != 0
                 val isLastFragment = (flags and 0x02) != 0

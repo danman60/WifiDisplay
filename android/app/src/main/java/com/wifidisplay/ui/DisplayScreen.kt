@@ -1,5 +1,7 @@
 package com.wifidisplay.ui
 
+import android.annotation.SuppressLint
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.foundation.background
@@ -9,11 +11,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.wifidisplay.codec.VideoDecoder
+import com.wifidisplay.network.TouchSender
 import com.wifidisplay.network.UdpReceiver
 import kotlinx.coroutines.*
 
@@ -34,7 +36,11 @@ fun DisplayScreen(serverIp: String, onDisconnect: () -> Unit) {
         // SurfaceView for video rendering
         AndroidView(
             factory = { context ->
-                SurfaceView(context).apply {
+                @SuppressLint("ClickableViewAccessibility")
+                val view = SurfaceView(context).apply {
+                    var touchSender: TouchSender? = null
+                    var lastMoveTime = 0L
+
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
                             val dec = VideoDecoder(holder.surface)
@@ -43,8 +49,12 @@ fun DisplayScreen(serverIp: String, onDisconnect: () -> Unit) {
                             val recv = UdpReceiver(5000)
                             receiver = recv
 
+                            val sender = TouchSender(serverIp)
+                            touchSender = sender
+
                             scope.launch(Dispatchers.IO) {
                                 try {
+                                    sender.start()
                                     dec.start()
                                     withContext(Dispatchers.Main) {
                                         status = "Connected"
@@ -70,11 +80,46 @@ fun DisplayScreen(serverIp: String, onDisconnect: () -> Unit) {
                         ) {}
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
+                            touchSender?.stop()
+                            touchSender = null
                             receiver?.stop()
                             decoder?.stop()
                         }
                     })
+
+                    setOnTouchListener { v, event ->
+                        val sender = touchSender ?: return@setOnTouchListener false
+                        val normX = event.x / v.width
+                        val normY = event.y / v.height
+
+                        when (event.action) {
+                            MotionEvent.ACTION_DOWN -> {
+                                scope.launch(Dispatchers.IO) {
+                                    sender.sendTouch(TouchSender.TOUCH_DOWN, normX, normY)
+                                }
+                                true
+                            }
+                            MotionEvent.ACTION_MOVE -> {
+                                val now = System.currentTimeMillis()
+                                if (now - lastMoveTime >= 16) {
+                                    lastMoveTime = now
+                                    scope.launch(Dispatchers.IO) {
+                                        sender.sendTouch(TouchSender.TOUCH_MOVE, normX, normY)
+                                    }
+                                }
+                                true
+                            }
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                scope.launch(Dispatchers.IO) {
+                                    sender.sendTouch(TouchSender.TOUCH_UP, normX, normY)
+                                }
+                                true
+                            }
+                            else -> false
+                        }
+                    }
                 }
+                view
             },
             modifier = Modifier.fillMaxSize()
         )

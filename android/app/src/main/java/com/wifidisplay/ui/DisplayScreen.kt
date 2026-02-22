@@ -68,6 +68,11 @@ fun DisplayScreen(serverIp: String, onDisconnect: () -> Unit) {
                                     withContext(Dispatchers.Main) {
                                         status = "Error: ${e.message}"
                                     }
+                                } finally {
+                                    // Ensure cleanup even on error/cancellation
+                                    sender.stop()
+                                    recv.stop()
+                                    dec.stop()
                                 }
                             }
                         }

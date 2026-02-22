@@ -6,12 +6,13 @@ use std::net::SocketAddr;
 /// Max UDP payload to stay under typical MTU (1500 - IP header 20 - UDP header 8)
 const MAX_UDP_PAYLOAD: usize = 1400;
 
-/// Packet header: 8 bytes
+/// Packet header: 12 bytes
 /// [0..4]  seq: u32 LE - global sequence number
 /// [4]     flags: u8 - bit 0: keyframe, bit 1: last fragment of NAL
-/// [5]     fragment_index: u8 - fragment number within this NAL (0-based)
-/// [6..8]  nal_size: u16 LE - total NAL size (for reassembly)
-const HEADER_SIZE: usize = 8;
+/// [5..7]  fragment_index: u16 LE - fragment number within this NAL (0-based)
+/// [7..11] nal_size: u32 LE - total NAL size (for reassembly)
+/// [11]    reserved: u8
+const HEADER_SIZE: usize = 12;
 const MAX_FRAGMENT_PAYLOAD: usize = MAX_UDP_PAYLOAD - HEADER_SIZE;
 
 pub struct UdpTransport {
@@ -31,8 +32,8 @@ impl UdpTransport {
         socket.set_broadcast(true)?;
 
         let target: SocketAddr = match client_ip {
-            Some(ip) => format!("{ip}:5000").parse()?,
-            None => "255.255.255.255:5000".parse()?,
+            Some(ip) => format!("{ip}:{port}").parse()?,
+            None => format!("255.255.255.255:{port}").parse()?,
         };
 
         tracing::info!("UDP transport: sending to {target}");
@@ -68,6 +69,11 @@ impl UdpTransport {
 
         let num_fragments = (nal_size + MAX_FRAGMENT_PAYLOAD - 1) / MAX_FRAGMENT_PAYLOAD;
 
+        if num_fragments > u16::MAX as usize {
+            tracing::warn!("NAL too large to fragment ({nal_size} bytes, {num_fragments} fragments), skipping");
+            return Ok(0);
+        }
+
         for i in 0..num_fragments {
             let offset = i * MAX_FRAGMENT_PAYLOAD;
             let end = (offset + MAX_FRAGMENT_PAYLOAD).min(nal_size);
@@ -80,12 +86,13 @@ impl UdpTransport {
 
             let mut packet = Vec::with_capacity(HEADER_SIZE + fragment.len());
 
-            // Header
-            packet.extend_from_slice(&seq.to_le_bytes()); // [0..4] seq
+            // Header (12 bytes)
+            packet.extend_from_slice(&seq.to_le_bytes());           // [0..4] seq
             let flags = (nal.is_keyframe as u8) | ((is_last as u8) << 1);
-            packet.push(flags); // [4] flags
-            packet.push(i as u8); // [5] fragment_index
-            packet.extend_from_slice(&(nal_size as u16).to_le_bytes()); // [6..8] nal_size
+            packet.push(flags);                                      // [4] flags
+            packet.extend_from_slice(&(i as u16).to_le_bytes());    // [5..7] fragment_index
+            packet.extend_from_slice(&(nal_size as u32).to_le_bytes()); // [7..11] nal_size
+            packet.push(0);                                          // [11] reserved
 
             // Payload
             packet.extend_from_slice(fragment);

@@ -14,6 +14,7 @@ class VideoDecoder(private val surface: Surface) {
     private var codec: MediaCodec? = null
     @Volatile
     private var started = false
+    private val lock = Any()
 
     companion object {
         private const val MIME_TYPE = "video/avc"
@@ -27,23 +28,25 @@ class VideoDecoder(private val surface: Surface) {
      * Initialize and start the decoder.
      */
     fun start() {
-        val format = MediaFormat.createVideoFormat(MIME_TYPE, DEFAULT_WIDTH, DEFAULT_HEIGHT).apply {
-            // Low latency mode (Android 11+)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        synchronized(lock) {
+            val format = MediaFormat.createVideoFormat(MIME_TYPE, DEFAULT_WIDTH, DEFAULT_HEIGHT).apply {
+                // Low latency mode (Android 11+)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                }
+                // Realtime priority
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
+                }
             }
-            // Realtime priority
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
-                setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
-            }
-        }
 
-        codec = MediaCodec.createDecoderByType(MIME_TYPE).apply {
-            configure(format, surface, null, 0)
-            start()
+            codec = MediaCodec.createDecoderByType(MIME_TYPE).apply {
+                configure(format, surface, null, 0)
+                start()
+            }
+            started = true
         }
-        started = true
     }
 
     /**
@@ -51,33 +54,34 @@ class VideoDecoder(private val surface: Surface) {
      * This will also drain any available output buffers to the surface.
      */
     fun submitNal(nalData: ByteArray) {
-        val codec = this.codec ?: return
-        if (!started) return
+        synchronized(lock) {
+            val codec = this.codec ?: return
+            if (!started) return
 
-        // Submit input
-        val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
-        if (inputIndex >= 0) {
-            val inputBuffer = codec.getInputBuffer(inputIndex) ?: return
-            inputBuffer.clear()
-            inputBuffer.put(nalData, 0, minOf(nalData.size, inputBuffer.capacity()))
-            codec.queueInputBuffer(
-                inputIndex,
-                0,
-                minOf(nalData.size, inputBuffer.capacity()),
-                System.nanoTime() / 1000,  // timestamp in microseconds
-                0
-            )
+            // Submit input
+            val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
+            if (inputIndex >= 0) {
+                val inputBuffer = codec.getInputBuffer(inputIndex) ?: return
+                inputBuffer.clear()
+                inputBuffer.put(nalData, 0, minOf(nalData.size, inputBuffer.capacity()))
+                codec.queueInputBuffer(
+                    inputIndex,
+                    0,
+                    minOf(nalData.size, inputBuffer.capacity()),
+                    System.nanoTime() / 1000,  // timestamp in microseconds
+                    0
+                )
+            }
+
+            // Drain output — render to surface
+            drainOutput(codec)
         }
-
-        // Drain output — render to surface
-        drainOutput()
     }
 
     /**
      * Drain decoded frames and render them to the surface.
      */
-    private fun drainOutput() {
-        val codec = this.codec ?: return
+    private fun drainOutput(codec: MediaCodec) {
         val bufferInfo = MediaCodec.BufferInfo()
 
         while (true) {
@@ -88,7 +92,6 @@ class VideoDecoder(private val surface: Surface) {
                     codec.releaseOutputBuffer(outputIndex, true)
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    val newFormat = codec.outputFormat
                     // Format changed — codec auto-adjusts, nothing to do
                 }
                 else -> break  // No more output available
@@ -100,13 +103,15 @@ class VideoDecoder(private val surface: Surface) {
      * Stop and release the decoder.
      */
     fun stop() {
-        started = false
-        try {
-            codec?.stop()
-            codec?.release()
-        } catch (e: Exception) {
-            // Ignore errors during cleanup
+        synchronized(lock) {
+            started = false
+            try {
+                codec?.stop()
+                codec?.release()
+            } catch (e: Exception) {
+                // Ignore errors during cleanup
+            }
+            codec = null
         }
-        codec = null
     }
 }

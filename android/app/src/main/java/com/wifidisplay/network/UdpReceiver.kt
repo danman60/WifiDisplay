@@ -9,11 +9,12 @@ import java.nio.ByteOrder
  * Receives UDP packets from the streaming server and reassembles
  * fragmented NAL units.
  *
- * Packet header (8 bytes):
+ * Packet header (12 bytes):
  * [0..4]  seq: u32 LE - global sequence number
  * [4]     flags: u8 - bit 0: keyframe, bit 1: last fragment
- * [5]     fragment_index: u8 - fragment number within NAL (0-based)
- * [6..8]  nal_size: u16 LE - total NAL size
+ * [5..7]  fragment_index: u16 LE - fragment number within NAL (0-based)
+ * [7..11] nal_size: u32 LE - total NAL size
+ * [11]    reserved: u8
  */
 class UdpReceiver(private val port: Int) {
 
@@ -22,7 +23,7 @@ class UdpReceiver(private val port: Int) {
     private var running = false
 
     companion object {
-        private const val HEADER_SIZE = 8
+        private const val HEADER_SIZE = 12
         private const val MAX_PACKET_SIZE = 1500
     }
 
@@ -52,12 +53,16 @@ class UdpReceiver(private val port: Int) {
                 if (packet.length < HEADER_SIZE) continue
 
                 val data = packet.data
-                val header = ByteBuffer.wrap(data, 0, HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
 
-                val seq = header.int           // [0..4] seq
-                val flags = data[4].toInt()     // [4] flags
-                val fragmentIndex = data[5].toInt() and 0xFF  // [5] fragment_index
-                val nalSize = (ByteBuffer.wrap(data, 6, 2).order(ByteOrder.LITTLE_ENDIAN).getShort().toInt() and 0xFFFF)  // [6..8] nal_size
+                // Parse header
+                val headerBuf = ByteBuffer.wrap(data, 0, HEADER_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+                val seq = headerBuf.int                    // [0..4] seq
+                val flags = data[4].toInt()                // [4] flags
+                val fragmentIndex = (ByteBuffer.wrap(data, 5, 2)
+                    .order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF)  // [5..7] fragment_index
+                val nalSize = (ByteBuffer.wrap(data, 7, 4)
+                    .order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL)  // [7..11] nal_size
+                // [11] reserved — skip
 
                 val isKeyframe = (flags and 0x01) != 0
                 val isLastFragment = (flags and 0x02) != 0
@@ -65,9 +70,15 @@ class UdpReceiver(private val port: Int) {
                 val payloadOffset = HEADER_SIZE
                 val payloadLength = packet.length - HEADER_SIZE
 
+                // Sanity check: reject absurdly large NALs (>16MB)
+                if (nalSize > 16 * 1024 * 1024) {
+                    currentNal = null
+                    continue
+                }
+
                 if (fragmentIndex == 0) {
                     // Start of a new NAL unit
-                    currentNal = ByteArray(nalSize)
+                    currentNal = ByteArray(nalSize.toInt())
                     currentNalOffset = 0
                     expectedFragmentIndex = 0
                 }

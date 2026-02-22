@@ -62,10 +62,11 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to create UDP transport")?,
     );
 
-    // Start touch input listener
+    // Start touch input listener — match by captured resolution to handle
+    // different enumeration order between scrap and Win32 EnumDisplayMonitors
     let touch_port = config.touch_port;
     let injector = Arc::new(
-        input::InputInjector::new(config.monitor_index)
+        input::InputInjector::new(config.monitor_index, width, height)
             .context("Failed to create input injector")?,
     );
     let touch_injector = injector.clone();

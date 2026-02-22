@@ -55,8 +55,9 @@ pub struct InputInjector {
 
 #[cfg(windows)]
 impl InputInjector {
-    /// Create an injector targeting the monitor at the given index.
-    pub fn new(monitor_index: usize) -> anyhow::Result<Self> {
+    /// Create an injector targeting the monitor that matches the captured resolution.
+    /// Falls back to monitor_index if no resolution match is found.
+    pub fn new(monitor_index: usize, captured_width: usize, captured_height: usize) -> anyhow::Result<Self> {
         // Query virtual desktop dimensions
         let desktop = unsafe {
             VirtualDesktop {
@@ -75,18 +76,32 @@ impl InputInjector {
             desktop.width, desktop.height, desktop.x, desktop.y
         );
 
-        // Enumerate monitors
+        // Enumerate monitors via Win32 API
         let monitors = enumerate_monitors()?;
         anyhow::ensure!(!monitors.is_empty(), "No monitors found");
-        anyhow::ensure!(monitor_index < monitors.len(),
-            "Monitor index {} out of range (found {} monitors)",
-            monitor_index, monitors.len());
 
-        let monitor = monitors[monitor_index].clone();
-        tracing::info!(
-            "Target monitor #{}: {}x{} at ({},{})",
-            monitor_index, monitor.width, monitor.height, monitor.x, monitor.y
-        );
+        // Match by captured resolution first (scrap and EnumDisplayMonitors may order differently)
+        let cw = captured_width as i32;
+        let ch = captured_height as i32;
+        let monitor = if let Some(m) = monitors.iter().find(|m| m.width == cw && m.height == ch) {
+            tracing::info!(
+                "Matched monitor by resolution {}x{} at ({},{})",
+                m.width, m.height, m.x, m.y
+            );
+            m.clone()
+        } else {
+            // Fallback to index
+            anyhow::ensure!(monitor_index < monitors.len(),
+                "Monitor index {} out of range (found {} monitors) and no resolution match for {}x{}",
+                monitor_index, monitors.len(), captured_width, captured_height);
+            let m = monitors[monitor_index].clone();
+            tracing::warn!(
+                "No resolution match for {}x{}, falling back to monitor #{}: {}x{} at ({},{})",
+                captured_width, captured_height,
+                monitor_index, m.width, m.height, m.x, m.y
+            );
+            m
+        };
 
         Ok(Self { monitor, desktop })
     }

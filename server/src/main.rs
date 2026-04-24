@@ -33,11 +33,18 @@ async fn main() -> anyhow::Result<()> {
     // Channel: capture thread sends raw BGRA frames to async encode+send pipeline
     let (frame_tx, mut frame_rx) = mpsc::channel::<capture::CapturedFrame>(2);
 
+    // Run the shared VDD / monitor selection ONCE here so touch + capture lock
+    // to the SAME physical screen. Both subsystems receive identity from this one call.
+    let selection = input::select_target_monitor(config.monitor_index)
+        .context("Failed to select target monitor")?;
+    let target_device_name = selection.bounds.device_name.clone();
+
     // Start capture on a dedicated thread (scrap uses blocking API)
-    let monitor_index = config.monitor_index;
+    let monitor_index_fallback = config.monitor_index;
     let target_fps = config.fps;
+    let cap_device_name = target_device_name.clone();
     std::thread::spawn(move || {
-        if let Err(e) = capture::capture_loop(monitor_index, target_fps, frame_tx) {
+        if let Err(e) = capture::capture_loop(cap_device_name, monitor_index_fallback, target_fps, frame_tx) {
             tracing::error!("Capture thread failed: {e:#}");
         }
     });
@@ -62,11 +69,11 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to create UDP transport")?,
     );
 
-    // Start touch input listener — match by captured resolution to handle
-    // different enumeration order between scrap and Win32 EnumDisplayMonitors
+    // Start touch input listener — use the pre-selected monitor bounds from main so
+    // touch + capture are guaranteed to target the same screen.
     let touch_port = config.touch_port;
     let injector = Arc::new(
-        input::InputInjector::new(config.monitor_index, width, height)
+        input::InputInjector::new(selection.bounds.clone(), width, height, &selection.reason)
             .context("Failed to create input injector")?,
     );
     let touch_injector = injector.clone();

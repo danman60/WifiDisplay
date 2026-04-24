@@ -36,15 +36,15 @@ const PACKET_SIZE: usize = 9;
 
 /// Monitor bounds in physical pixels plus adapter/device identity for VDD matching.
 #[derive(Debug, Clone)]
-struct MonitorBounds {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+pub struct MonitorBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
     /// Monitor display name, e.g. `\\.\DISPLAY3`.
-    device_name: String,
+    pub device_name: String,
     /// Adapter DeviceString, e.g. `"IddSampleDriver Device"`, `"Parsec Virtual Display Adapter"`, `"NVIDIA GeForce RTX 4070"`.
-    adapter_string: String,
+    pub adapter_string: String,
 }
 
 /// Returns true if this adapter/device looks like a Virtual Display Driver
@@ -78,9 +78,11 @@ pub struct InputInjector {
 
 #[cfg(windows)]
 impl InputInjector {
-    /// Create an injector targeting the monitor that matches the captured resolution.
-    /// Falls back to monitor_index if no resolution match is found.
-    pub fn new(monitor_index: usize, captured_width: usize, captured_height: usize) -> anyhow::Result<Self> {
+    /// Create an injector for the already-selected monitor bounds. main.rs runs the
+    /// shared `select_target_monitor` once and threads the bounds here AND threads
+    /// the device_name to the capture loop, guaranteeing touch+capture lock to the
+    /// same physical screen regardless of scrap vs EnumDisplayMonitors ordering.
+    pub fn new(monitor: MonitorBounds, captured_width: usize, captured_height: usize, reason: &str) -> anyhow::Result<Self> {
         // Query virtual desktop dimensions
         let desktop = unsafe {
             VirtualDesktop {
@@ -99,90 +101,19 @@ impl InputInjector {
             desktop.width, desktop.height, desktop.x, desktop.y
         );
 
-        // Enumerate monitors via Win32 API
-        let monitors = enumerate_monitors()?;
-        anyhow::ensure!(!monitors.is_empty(), "No monitors found");
-
-        // Log all enumerated monitors up-front so we have full diagnostic output on DART.
-        for (i, m) in monitors.iter().enumerate() {
-            tracing::info!(
-                "monitor[{}] {}x{} at ({},{}) device={} adapter={:?}",
-                i, m.width, m.height, m.x, m.y, m.device_name, m.adapter_string
-            );
-        }
-
-        // ── VDD selection priority ─────────────────────────────────────────────
-        // (1) env WIFI_DISPLAY_VDD_MATCH=<substring> — operator override, matches
-        //     case-insensitively against device_name or adapter_string.
-        // (2) heuristic: adapter/device string looks like a virtual display driver
-        //     (IddSampleDriver, Parsec VDD, Amyuni, VirtualDisplayDriver, etc.)
-        // (3) fallback: use monitor_index.
-        //
-        // Why: scrap::Display and EnumDisplayMonitors may iterate monitors in
-        // different orders, so touch can land on the wrong physical screen.
-        // The VDD is the "tablet mirror" target in practice, so locking to it
-        // by identity (not index) is the reliable fix.
         let cw = captured_width as i32;
         let ch = captured_height as i32;
 
-        let override_substr = std::env::var("WIFI_DISPLAY_VDD_MATCH").ok();
-
-        let mut selected_idx: Option<usize> = None;
-        let mut reason: &'static str = "";
-
-        if let Some(needle) = override_substr.as_deref() {
-            let n = needle.trim();
-            if !n.is_empty() {
-                let nl = n.to_ascii_lowercase();
-                if let Some((i, _)) = monitors.iter().enumerate().find(|(_, m)| {
-                    m.device_name.to_ascii_lowercase().contains(&nl)
-                        || m.adapter_string.to_ascii_lowercase().contains(&nl)
-                }) {
-                    selected_idx = Some(i);
-                    reason = "env WIFI_DISPLAY_VDD_MATCH";
-                } else {
-                    tracing::warn!("WIFI_DISPLAY_VDD_MATCH={n:?} did not match any monitor adapter/device string");
-                }
-            }
-        }
-
-        if selected_idx.is_none() {
-            if let Some((i, _)) = monitors.iter().enumerate()
-                .find(|(_, m)| looks_like_vdd(&m.adapter_string, &m.device_name))
-            {
-                selected_idx = Some(i);
-                reason = "VDD heuristic match";
-            }
-        }
-
-        if selected_idx.is_none() {
-            if monitor_index < monitors.len() {
-                selected_idx = Some(monitor_index);
-                reason = "--monitor-index fallback";
-            } else if let Some((i, _)) = monitors.iter().enumerate()
-                .find(|(_, m)| m.width == cw && m.height == ch)
-            {
-                selected_idx = Some(i);
-                reason = "resolution-match fallback";
-            }
-        }
-
-        let idx = selected_idx.ok_or_else(|| anyhow::anyhow!(
-            "Could not select any monitor for touch injection ({} monitors enumerated, index={}, capture={}x{})",
-            monitors.len(), monitor_index, captured_width, captured_height
-        ))?;
-
-        let monitor = monitors[idx].clone();
         if monitor.width == cw && monitor.height == ch {
             tracing::info!(
-                "Touch target LOCKED to monitor[{}] {}x{} at ({},{}) device={} adapter={:?} — reason: {}",
-                idx, monitor.width, monitor.height, monitor.x, monitor.y,
+                "Touch target LOCKED to {}x{} at ({},{}) device={} adapter={:?} — reason: {}",
+                monitor.width, monitor.height, monitor.x, monitor.y,
                 monitor.device_name, monitor.adapter_string, reason
             );
         } else {
             tracing::warn!(
-                "Touch target LOCKED to monitor[{}] {}x{} at ({},{}) device={} adapter={:?} — reason: {} (capture is {}x{}; scrap/EnumDisplayMonitors may disagree on order)",
-                idx, monitor.width, monitor.height, monitor.x, monitor.y,
+                "Touch target LOCKED to {}x{} at ({},{}) device={} adapter={:?} — reason: {} (capture is {}x{}; scrap/EnumDisplayMonitors may disagree on order)",
+                monitor.width, monitor.height, monitor.x, monitor.y,
                 monitor.device_name, monitor.adapter_string, reason, cw, ch
             );
         }
@@ -273,30 +204,59 @@ fn wide_to_string(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..n])
 }
 
+/// Build a `DeviceName (\\.\DISPLAYn) → DeviceString (e.g. "Virtual Display Driver")` map
+/// by iterating adapters with `EnumDisplayDevicesW(NULL, iDevNum, ...)`.
+///
+/// Prior implementation called `EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, ...)` passing
+/// the monitor's `szDevice` as the first arg. That variant returns monitor-panel info
+/// ("Generic PnP Monitor"), not the adapter. This iterates adapters instead.
+#[cfg(windows)]
+fn build_adapter_map() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut i_dev_num: u32 = 0;
+    loop {
+        let mut adapter = DISPLAY_DEVICEW {
+            cb: size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        // lpDevice = null → enumerate adapters (display devices), not monitors.
+        let ok = unsafe {
+            EnumDisplayDevicesW(PCWSTR::null(), i_dev_num, &mut adapter, 0).as_bool()
+        };
+        if !ok {
+            break;
+        }
+        let name = wide_to_string(&adapter.DeviceName);       // e.g. \\.\DISPLAY3
+        let string = wide_to_string(&adapter.DeviceString);   // e.g. "Virtual Display Driver"
+        if !name.is_empty() {
+            map.insert(name, string);
+        }
+        i_dev_num += 1;
+    }
+    map
+}
+
 /// Look up the adapter DeviceString for a monitor display name (e.g. `\\.\DISPLAY3`).
 /// Returns empty string if the lookup fails.
 #[cfg(windows)]
-fn adapter_string_for_device(device_name: &str) -> String {
-    let mut adapter = DISPLAY_DEVICEW {
-        cb: size_of::<DISPLAY_DEVICEW>() as u32,
-        ..Default::default()
-    };
+fn adapter_string_for_device(device_name: &str, map: &std::collections::HashMap<String, String>) -> String {
+    map.get(device_name).cloned().unwrap_or_default()
+}
 
-    // Convert device_name to UTF-16 null-terminated.
-    let wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
-
-    // Index 0 = the adapter for this display device (Win32 quirk).
-    let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut adapter, 0).as_bool() };
-    if !ok {
-        return String::new();
-    }
-    wide_to_string(&adapter.DeviceString)
+/// Payload for EnumDisplayMonitors callback: monitor list + adapter name→string map.
+#[cfg(windows)]
+struct EnumPayload {
+    monitors: Vec<MonitorBounds>,
+    adapter_map: std::collections::HashMap<String, String>,
 }
 
 /// Enumerate all monitors and return their bounds + identity fields.
 #[cfg(windows)]
 fn enumerate_monitors() -> anyhow::Result<Vec<MonitorBounds>> {
-    let mut monitors: Vec<MonitorBounds> = Vec::new();
+    let mut payload = EnumPayload {
+        monitors: Vec::new(),
+        adapter_map: build_adapter_map(),
+    };
 
     unsafe extern "system" fn callback(
         hmonitor: HMONITOR,
@@ -304,7 +264,7 @@ fn enumerate_monitors() -> anyhow::Result<Vec<MonitorBounds>> {
         _rect: *mut RECT,
         lparam: LPARAM,
     ) -> BOOL {
-        let monitors = &mut *(lparam.0 as *mut Vec<MonitorBounds>);
+        let payload = &mut *(lparam.0 as *mut EnumPayload);
 
         let mut info = MONITORINFOEXW {
             monitorInfo: MONITORINFO {
@@ -318,8 +278,8 @@ fn enumerate_monitors() -> anyhow::Result<Vec<MonitorBounds>> {
         if unsafe { GetMonitorInfoW(hmonitor, info_ptr) }.as_bool() {
             let rc = info.monitorInfo.rcMonitor;
             let device_name = wide_to_string(&info.szDevice);
-            let adapter_string = adapter_string_for_device(&device_name);
-            monitors.push(MonitorBounds {
+            let adapter_string = adapter_string_for_device(&device_name, &payload.adapter_map);
+            payload.monitors.push(MonitorBounds {
                 x: rc.left,
                 y: rc.top,
                 width: rc.right - rc.left,
@@ -337,13 +297,90 @@ fn enumerate_monitors() -> anyhow::Result<Vec<MonitorBounds>> {
             HDC::default(),
             None,
             Some(callback),
-            LPARAM(&mut monitors as *mut Vec<MonitorBounds> as isize),
+            LPARAM(&mut payload as *mut EnumPayload as isize),
         )
         .ok()
         .context("EnumDisplayMonitors failed")?;
     }
 
-    Ok(monitors)
+    Ok(payload.monitors)
+}
+
+/// Result of VDD / target-monitor selection.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct TargetSelection {
+    pub bounds: MonitorBounds,
+    pub reason: String,
+}
+
+/// Shared VDD selection logic used by BOTH touch injection and screen capture.
+///
+/// Priority:
+///   1. env `WIFI_DISPLAY_VDD_MATCH=<substring>` — operator override (case-insensitive match
+///      against device_name OR adapter_string).
+///   2. Heuristic: adapter/device string looks like a virtual display driver (IddSampleDriver,
+///      Parsec VDD, Amyuni, VirtualDisplayDriver, etc.) — see `looks_like_vdd`.
+///   3. Fallback: `monitor_index_fallback` (the `--monitor-index` CLI arg).
+///
+/// Logs every enumerated monitor and the final selection. Returns error only if zero
+/// monitors enumerated or index fallback is also out of range.
+#[cfg(windows)]
+pub fn select_target_monitor(monitor_index_fallback: usize) -> anyhow::Result<TargetSelection> {
+    let monitors = enumerate_monitors()?;
+    anyhow::ensure!(!monitors.is_empty(), "No monitors found");
+
+    for (i, m) in monitors.iter().enumerate() {
+        tracing::info!(
+            "monitor[{}] {}x{} at ({},{}) device={} adapter={:?}",
+            i, m.width, m.height, m.x, m.y, m.device_name, m.adapter_string
+        );
+    }
+
+    let override_substr = std::env::var("WIFI_DISPLAY_VDD_MATCH").ok();
+
+    let mut selected_idx: Option<usize> = None;
+    let mut reason: String = String::new();
+
+    if let Some(needle) = override_substr.as_deref() {
+        let n = needle.trim();
+        if !n.is_empty() {
+            let nl = n.to_ascii_lowercase();
+            if let Some((i, _)) = monitors.iter().enumerate().find(|(_, m)| {
+                m.device_name.to_ascii_lowercase().contains(&nl)
+                    || m.adapter_string.to_ascii_lowercase().contains(&nl)
+            }) {
+                selected_idx = Some(i);
+                reason = format!("env WIFI_DISPLAY_VDD_MATCH={:?}", n);
+            } else {
+                tracing::warn!("WIFI_DISPLAY_VDD_MATCH={n:?} did not match any monitor adapter/device string");
+            }
+        }
+    }
+
+    if selected_idx.is_none() {
+        if let Some((i, _)) = monitors.iter().enumerate()
+            .find(|(_, m)| looks_like_vdd(&m.adapter_string, &m.device_name))
+        {
+            selected_idx = Some(i);
+            reason = "VDD heuristic match".to_string();
+        }
+    }
+
+    if selected_idx.is_none() {
+        if monitor_index_fallback < monitors.len() {
+            selected_idx = Some(monitor_index_fallback);
+            reason = "--monitor-index fallback".to_string();
+        }
+    }
+
+    let idx = selected_idx.ok_or_else(|| anyhow::anyhow!(
+        "Could not select any monitor ({} monitors enumerated, index={})",
+        monitors.len(), monitor_index_fallback
+    ))?;
+
+    let bounds = monitors[idx].clone();
+    Ok(TargetSelection { bounds, reason })
 }
 
 /// Listen for touch packets on the given UDP port and inject mouse events.

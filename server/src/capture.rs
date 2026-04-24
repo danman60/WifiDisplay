@@ -19,33 +19,80 @@ pub fn list_displays() -> anyhow::Result<Vec<(usize, usize, usize)>> {
 }
 
 /// Blocking capture loop. Runs on a dedicated thread.
-/// Captures frames from the specified monitor and sends them through the channel.
+///
+/// Picks the scrap Display by matching `target_device_name` (e.g. `\\.\DISPLAY3`)
+/// case-insensitively against `Display::device_name()` (exposed by the local
+/// scrap-local fork). This is the same form returned by Win32
+/// `GetMonitorInfoW(... szDevice)`, so touch and capture lock to the SAME
+/// physical screen regardless of the (different) enumeration orders of scrap vs
+/// EnumDisplayMonitors.
+///
+/// Falls back to `monitor_index_fallback` when no scrap display matches (e.g.
+/// unit-test harness where device_name is empty, or a future Windows API change).
 pub fn capture_loop(
-    monitor_index: usize,
+    target_device_name: String,
+    monitor_index_fallback: usize,
     target_fps: u32,
     tx: mpsc::Sender<CapturedFrame>,
 ) -> anyhow::Result<()> {
     let displays = Display::all().context("Failed to enumerate displays")?;
 
-    if monitor_index >= displays.len() {
-        bail!(
-            "Monitor index {} out of range. Found {} display(s).",
-            monitor_index,
-            displays.len()
+    if displays.is_empty() {
+        bail!("No scrap displays found");
+    }
+
+    // Log every scrap display we found so DART logs show the full picture
+    // alongside the EnumDisplayMonitors list emitted from input.rs.
+    for (i, d) in displays.iter().enumerate() {
+        tracing::info!(
+            "scrap_display[{}] {}x{} device={:?}",
+            i, d.width(), d.height(), d.device_name()
         );
     }
 
-    // scrap::Display doesn't implement Clone, need to re-enumerate
-    // and pick by index
+    // scrap::Display is !Clone, so re-enumerate and consume by index.
     let displays = Display::all()?;
+    let target_lower = target_device_name.to_ascii_lowercase();
+    let total = displays.len();
+
+    let mut match_idx: Option<usize> = None;
+    let mut match_reason: &'static str = "";
+
+    if !target_lower.is_empty() {
+        for (i, d) in displays.iter().enumerate() {
+            if d.device_name().to_ascii_lowercase() == target_lower {
+                match_idx = Some(i);
+                match_reason = "DXGI DeviceName match";
+                break;
+            }
+        }
+    }
+
+    if match_idx.is_none() {
+        if monitor_index_fallback < total {
+            match_idx = Some(monitor_index_fallback);
+            match_reason = "--monitor-index fallback";
+        } else {
+            bail!(
+                "Capture: no scrap display matched device_name={:?} and --monitor-index={} is out of range (found {} displays)",
+                target_device_name, monitor_index_fallback, total
+            );
+        }
+    }
+
+    let idx = match_idx.unwrap();
     let display = displays
         .into_iter()
-        .nth(monitor_index)
-        .context("Display disappeared")?;
+        .nth(idx)
+        .context("Display disappeared between enumerations")?;
 
+    let device_name = display.device_name();
     let width = display.width();
     let height = display.height();
-    tracing::info!("Capturing monitor #{monitor_index}: {width}x{height}");
+    tracing::info!(
+        "Capture target LOCKED to scrap_display[{}] device={} size={}x{} — reason: {} (target was {:?})",
+        idx, device_name, width, height, match_reason, target_device_name
+    );
 
     let mut capturer = Capturer::new(display).context("Failed to create capturer")?;
 

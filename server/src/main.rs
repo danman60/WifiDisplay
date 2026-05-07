@@ -59,8 +59,20 @@ async fn main() -> anyhow::Result<()> {
     let height = first_frame.height;
     tracing::info!("Captured resolution: {width}x{height}");
 
-    let mut enc = encoder::H264Encoder::new(width, height, config.bitrate, target_fps)
-        .context("Failed to create H.264 encoder")?;
+    let encoder_kind: encoder::EncoderKind = config
+        .encoder
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))
+        .context("Invalid --encoder value")?;
+    let mut enc = encoder::VideoEncoder::new(
+        encoder_kind,
+        width,
+        height,
+        config.bitrate,
+        target_fps,
+        config.ffmpeg_path.as_deref(),
+    )
+    .context("Failed to create video encoder")?;
 
     // Initialize transport
     let transport = Arc::new(
